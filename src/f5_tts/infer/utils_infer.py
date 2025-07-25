@@ -26,7 +26,7 @@ from pydub import AudioSegment, silence
 from transformers import pipeline
 from vocos import Vocos
 
-from f5_tts.model import CFM
+from f5_tts.model import CFM, CFM_MDD
 from f5_tts.model.utils import (
     get_tokenizer,
     convert_char_to_pinyin,
@@ -250,6 +250,46 @@ def load_model(
 
     vocab_char_map, vocab_size = get_tokenizer(vocab_file, tokenizer)
     model = CFM(
+        transformer=model_cls(**model_cfg, text_num_embeds=vocab_size, mel_dim=n_mel_channels),
+        mel_spec_kwargs=dict(
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+            n_mel_channels=n_mel_channels,
+            target_sample_rate=target_sample_rate,
+            mel_spec_type=mel_spec_type,
+        ),
+        odeint_kwargs=dict(
+            method=ode_method,
+        ),
+        vocab_char_map=vocab_char_map,
+    ).to(device)
+
+    dtype = torch.float32 if mel_spec_type == "bigvgan" else None
+    model = load_checkpoint(model, ckpt_path, device, dtype=dtype, use_ema=use_ema)
+
+    return model
+
+def load_model_mdd(
+    model_cls,
+    model_cfg,
+    ckpt_path,
+    mel_spec_type=mel_spec_type,
+    vocab_file="",
+    ode_method=ode_method,
+    use_ema=True,
+    device=device,
+):
+    if vocab_file == "":
+        vocab_file = str(files("f5_tts").joinpath("infer/examples/vocab.txt"))
+    tokenizer = "custom"
+
+    print("\nvocab : ", vocab_file)
+    print("token : ", tokenizer)
+    print("model : ", ckpt_path, "\n")
+
+    vocab_char_map, vocab_size = get_tokenizer(vocab_file, tokenizer)
+    model = CFM_MDD(
         transformer=model_cls(**model_cfg, text_num_embeds=vocab_size, mel_dim=n_mel_channels),
         mel_spec_kwargs=dict(
             n_fft=n_fft,
