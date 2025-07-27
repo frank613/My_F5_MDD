@@ -75,8 +75,6 @@ class CFM_MDD(nn.Module):
 
         # vocab map for tokenization
         self.vocab_char_map = vocab_char_map
-        
-        self.norm = m = Normal(torch.tensor([0.0]), torch.tensor([1.0]))
 
     @property
     def device(self):
@@ -102,7 +100,6 @@ class CFM_MDD(nn.Module):
         edit_mask=None,
     ):
         self.eval()
-        pdb.set_trace()
         # raw wave
         if cond.ndim == 2:
             cond = self.mel_spec(cond)
@@ -233,13 +230,11 @@ class CFM_MDD(nn.Module):
         assert self.odeint_kwargs["method"] == "euler"
         self.odeint_kwargs["method"] = "euler_mdd"
         # raw wave
-        if mel_target[0].ndim == 2:
+        if mel_target[0].ndim != 2:
             # cond = self.mel_spec(cond)
             # cond = cond.permute(0, 2, 1)
             # assert cond.shape[-1] == self.num_channels
             sys.exit("MDD: input must be mel")
-        
-        dtype = next(self.parameters()).dtype
         
         ## To tensors
         mel_target = torch.stack(mel_target)        
@@ -257,7 +252,7 @@ class CFM_MDD(nn.Module):
         else:
             sys.exit("MDD: duariont must be a int")
         
-        max_t_len = torch.maximum((text != -1).sum(dim=-1))  # MDD: duration at least text
+        max_t_len = torch.max((text != -1).sum(dim=-1))  # MDD: duration at least text
 
         ##MDD check
         assert torch.all(duration == duration[0])
@@ -319,32 +314,27 @@ class CFM_MDD(nn.Module):
         
         ##reversed dt for forward ODE
         dt = [ t[len(t)-i-2] - t[len(t)-i-1] for i in range(len(t)-1)]
-        pdb.set_trace()
         
         ##backward pass
         trajectory, jacob_trace = odeint_jacobian(fn, y1, t, **self.odeint_kwargs)
         y0 = trajectory[-1]
         ##inverse jacob for forward pass
         jacob_trace = jacob_trace.flip([0])
-        
         self.transformer.clear_cache()
-        
+        ##NULL
         trajectory_null, jacob_trace_null = odeint_jacobian(fn_null, y1, t, **self.odeint_kwargs)
         y0_null = trajectory_null[-1]
-        ##inverse jacob for forward pass
         jacob_trace_null = jacob_trace_null.flip([0])
-        
         self.transformer.clear_cache()
         
-   
-        log_prob_y0 = self.norm.log_prob(y0)
-        log_prob_y0_null = self.norm.log_prob(y0_null)
+        norm = Normal(torch.tensor([0.0], device=device), torch.tensor([1.0],device=device))
+        log_prob_y0 = norm.log_prob(y0).sum(-1)
+        log_prob_y0_null = norm.log_prob(y0_null).sum(-1)
         ## manual Euler continous change of variable
         ## the last jacob is not needed for forward pass
-        for i, jacob_t, jacob_t_null in enumerate(zip(jacob_trace[:-1], jacob_trace_null[-1])):
+        for i, (jacob_t, jacob_t_null) in enumerate(zip(jacob_trace[:-1], jacob_trace_null[:-1])):
             log_prob_y0 += -jacob_t*dt[i]
             log_prob_y0_null += jacob_t_null*dt[i]
-
         return log_prob_y0, log_prob_y0_null
     
     def forward(
