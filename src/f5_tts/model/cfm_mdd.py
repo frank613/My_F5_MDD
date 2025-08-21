@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
-from torchdiffeq import odeint,odeint_jacobian
+from torchdiffeq import odeint,odeint_jacobian,odeint_jacobian_wrong,odeint_dist
 
 from f5_tts.model.modules import MelSpec
 from f5_tts.model.utils import (
@@ -39,7 +39,7 @@ class CFM_MDD(nn.Module):
         odeint_kwargs: dict = dict(
             # atol = 1e-5,
             # rtol = 1e-5,
-            method="euler"  # 'midpoint'
+            method="euler_mdd"  # 'midpoint'
         ),
         audio_drop_prob=0.3,
         cond_drop_prob=0.2,
@@ -218,17 +218,17 @@ class CFM_MDD(nn.Module):
         *,
         lens: int["b"] | None = None,  # noqa: F821
         steps=32,
-        cfg_strength=1.0,
+        cfg_strength=0,
         sway_sampling_coef=None,
         max_duration=4096,
         duplicate_test=False,
         diff_symbol=None,
         phoneme_mask_list=None,
+        t_inerval=None,
     ):
         self.eval()
         # check methods
-        assert self.odeint_kwargs["method"] == "euler"
-        self.odeint_kwargs["method"] = "euler_mdd"
+        assert self.odeint_kwargs["method"] == "euler_mdd"
         # raw wave
         if mel_target[0].ndim != 2:
             # cond = self.mel_spec(cond)
@@ -238,6 +238,546 @@ class CFM_MDD(nn.Module):
         
         ## To tensors
         mel_target = torch.stack(mel_target)        
+        batch_size, seq_len, device = *mel_target.shape[:2], mel_target.device
+        
+        if isinstance(text, list):
+            if exists(self.vocab_char_map):
+                text = list_str_to_idx(text, self.vocab_char_map).to(device)
+            else:
+                sys.exit("MDD must have a vocab file")
+            assert text.shape[0] == batch_size
+
+        if isinstance(duration, int):
+            duration = torch.full((batch_size,), duration, device=device, dtype=torch.long)
+        else:
+            sys.exit("MDD: duariont must be a int")
+        
+        max_t_len = torch.max((text != -1).sum(dim=-1))  # MDD: duration at least text
+
+        ##MDD check
+        assert torch.all(duration == duration[0])
+        assert seq_len == duration[0]
+        assert lens is None
+        assert duration[0] <= max_duration
+        assert duration[0] >= max_t_len         
+        # cond_mask should be all 1 for MDD
+        cond_mask = lens_to_mask(duration)
+        assert cond_mask[0].sum() == seq_len
+   
+        # duplicate test corner for inner time step oberservation
+        if duplicate_test:
+            #test_cond = F.pad(cond, (0, 0, cond_seq_len, max_duration - 2 * cond_seq_len), value=0.0)
+            sys.exit("MDD: not supported.")
+            
+        ##MDD, we don't pad anything than masking the target segment)
+        cond_mask = torch.stack(phoneme_mask_list).unsqueeze(-1)
+        step_cond = torch.where(
+            cond_mask, mel_target, torch.zeros_like(mel_target)
+        )  
+        att_mask = None
+        
+        ##test
+        # step_cond=step_cond[:10]
+        # text=text[:10]
+        
+        # neural ode
+        def fn(t, x):
+            # at each step, conditioning is fixed
+            # step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
+
+            # predict flow
+            pred = self.transformer(
+                x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=False, drop_text=False, cache=True
+            )
+            if cfg_strength < 1e-5:
+                return pred
+
+            null_pred = self.transformer(
+                x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=True, drop_text=True, cache=True
+            )
+            return pred + (pred - null_pred) * cfg_strength
+        
+        if diff_symbol == None:  ## all ZERO cases, check class TextEmbedding
+            def fn_null(t, x):
+                null_pred = self.transformer(
+                    x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=False, drop_text=True, cache=True
+                )
+                return null_pred
+        else: 
+            def fn_null(t, x):
+                text_null = torch.ones_like(text)*self.vocab_char_map[diff_symbol]
+                null_pred = self.transformer(
+                    x=x, cond=step_cond, text=text_null, time=t, mask=att_mask, drop_audio_cond=False, drop_text=False, cache=True
+                )
+                return null_pred
+        # speech input
+        y1 = mel_target
+        t_start = 1
+        t = torch.linspace(t_start, 0, steps + 1, device=self.device, dtype=step_cond.dtype)
+        if sway_sampling_coef is not None:
+            t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+        
+        ##reversed dt for forward ODE
+        dt = [ t[len(t)-i-2] - t[len(t)-i-1] for i in range(len(t)-1)]
+        
+        ##backward pass
+        
+        # #test
+        # y1=y1[:10]
+        
+        trajectory, jacob_trace = odeint_jacobian(fn, y1, t, cond_mask.squeeze(-1), t_inerval, cfg_strength,  **self.odeint_kwargs)
+        y0 = trajectory[-1]
+        ##inverse jacob for forward pass
+        jacob_trace = jacob_trace.flip([0])
+        self.transformer.clear_cache()
+        ##NULL
+        trajectory_null, jacob_trace_null = odeint_jacobian(fn_null, y1, t, cond_mask.squeeze(-1), t_inerval, cfg_strength, **self.odeint_kwargs)
+        y0_null = trajectory_null[-1]
+        jacob_trace_null = jacob_trace_null.flip([0])
+        self.transformer.clear_cache()
+        
+        norm = Normal(torch.tensor([0.0], device=device), torch.tensor([1.0],device=device))
+        log_prob_y0 = norm.log_prob(y0).sum(-1)
+        log_prob_y0_null = norm.log_prob(y0_null).sum(-1)
+        ## manual Euler continous change of variable
+        ## the last jacob is not needed for forward pass
+        for i, (jacob_t, jacob_t_null) in enumerate(zip(jacob_trace[:-1], jacob_trace_null[:-1])):
+            log_prob_y0 += -jacob_t*dt[i]
+            log_prob_y0_null += -jacob_t_null*dt[i]
+        return log_prob_y0, log_prob_y0_null
+    
+    ##  Jacobian replace 1, the length
+    def compute_traLen(
+        self,
+        mel_target: float["b n d"] | float["b nw"],  # noqa: F722
+        text: int["b nt"] | list[str],  # noqa: F722
+        duration: int | int["b"],  # noqa: F821
+        *,
+        lens: int["b"] | None = None,  # noqa: F821
+        steps=32,
+        cfg_strength=0,
+        sway_sampling_coef=None,
+        max_duration=4096,
+        duplicate_test=False,
+        diff_symbol=None,
+        phoneme_mask_list=None,
+    ):
+        self.eval()
+        # check methods, it does not matter 
+        assert self.odeint_kwargs["method"] == "euler_mdd" or self.odeint_kwargs["method"] == "euler"
+        # raw wave
+        if mel_target[0].ndim != 2:
+            # cond = self.mel_spec(cond)
+            # cond = cond.permute(0, 2, 1)
+            # assert cond.shape[-1] == self.num_channels
+            sys.exit("MDD: input must be mel")
+        
+        ## To tensors
+        mel_target = torch.stack(mel_target)        
+        batch_size, seq_len, device = *mel_target.shape[:2], mel_target.device
+        
+        if isinstance(text, list):
+            if exists(self.vocab_char_map):
+                text = list_str_to_idx(text, self.vocab_char_map).to(device)
+            else:
+                sys.exit("MDD must have a vocab file")
+            assert text.shape[0] == batch_size
+
+        if isinstance(duration, int):
+            duration = torch.full((batch_size,), duration, device=device, dtype=torch.long)
+        else:
+            sys.exit("MDD: duariont must be a int")
+        
+        max_t_len = torch.max((text != -1).sum(dim=-1))  # MDD: duration at least text
+
+        ##MDD check
+        assert torch.all(duration == duration[0])
+        assert seq_len == duration[0]
+        assert lens is None
+        assert duration[0] <= max_duration
+        assert duration[0] >= max_t_len         
+        # cond_mask should be all 1 for MDD
+        cond_mask = lens_to_mask(duration)
+        assert cond_mask[0].sum() == seq_len
+   
+        # duplicate test corner for inner time step oberservation
+        if duplicate_test:
+            #test_cond = F.pad(cond, (0, 0, cond_seq_len, max_duration - 2 * cond_seq_len), value=0.0)
+            sys.exit("MDD: not supported.")
+            
+        ##MDD, we don't pad anything than masking the target segment)
+        cond_mask = torch.stack(phoneme_mask_list).unsqueeze(-1)
+        step_cond = torch.where(
+            cond_mask, mel_target, torch.zeros_like(mel_target)
+        )  
+        att_mask = None
+        
+        ##test
+        # step_cond=step_cond[:10]
+        # text=text[:10]
+        
+        # neural ode
+        def fn(t, x):
+            # at each step, conditioning is fixed
+            # step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
+
+            # predict flow
+            pred = self.transformer(
+                x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=False, drop_text=False, cache=True
+            )
+            if cfg_strength < 1e-5:
+                return pred
+
+            null_pred = self.transformer(
+                x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=True, drop_text=True, cache=True
+            )
+            return pred + (pred - null_pred) * cfg_strength
+        
+        if diff_symbol == None:  ## all ZERO cases, check class TextEmbedding
+            def fn_null(t, x):
+                null_pred = self.transformer(
+                    x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=False, drop_text=True, cache=True
+                )
+                return null_pred
+        else: 
+            def fn_null(t, x):
+                text_null = torch.ones_like(text)*self.vocab_char_map[diff_symbol]
+                null_pred = self.transformer(
+                    x=x, cond=step_cond, text=text_null, time=t, mask=att_mask, drop_audio_cond=False, drop_text=False, cache=True
+                )
+                return null_pred
+        # speech input
+        y1 = mel_target
+        t_start = 1
+        t = torch.linspace(t_start, 0, steps + 1, device=self.device, dtype=step_cond.dtype)
+  
+        if sway_sampling_coef is not None:
+            t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+        
+        ##reversed dt for forward ODE
+        dt = [ t[len(t)-i-2] - t[len(t)-i-1] for i in range(len(t)-1)]
+        
+        ##backward pass
+        
+        # #test
+        # y1=y1[:10]
+        self.odeint_kwargs["method"] = "euler_mdd"
+        opt_dist, step_dist = odeint_dist(fn, y1, t, **self.odeint_kwargs)
+        self.transformer.clear_cache()
+        ##NULL
+        opt_dist_null, step_dist_null = odeint_dist(fn_null, y1, t, **self.odeint_kwargs)
+        self.transformer.clear_cache()
+        ##distance based log-prob
+        ##check if opt_dist_null == opt_dist? No!
+        log_prob_y0 = torch.log(opt_dist/step_dist)
+        log_prob_y0_null = torch.log(opt_dist_null/step_dist_null)
+    
+        return log_prob_y0, log_prob_y0_null
+    
+    ##  Jacobian replace 2, cos similarity
+    def compute_similarity(
+        self,
+        mel_target: float["b n d"] | float["b nw"],  # noqa: F722
+        text: int["b nt"] | list[str],  # noqa: F722
+        duration: int | int["b"],  # noqa: F821
+        *,
+        lens: int["b"] | None = None,  # noqa: F821
+        steps=32,
+        cfg_strength=0,
+        sway_sampling_coef=None,
+        max_duration=4096,
+        duplicate_test=False,
+        diff_symbol=None,
+        phoneme_mask_list=None,
+    ):
+        self.eval()
+        # check methods, it does not matter 
+        assert self.odeint_kwargs["method"] == "euler_mdd" or self.odeint_kwargs["method"] == "euler"
+        # raw wave
+        if mel_target[0].ndim != 2:
+            # cond = self.mel_spec(cond)
+            # cond = cond.permute(0, 2, 1)
+            # assert cond.shape[-1] == self.num_channels
+            sys.exit("MDD: input must be mel")
+        
+        ## To tensors
+        mel_target = torch.stack(mel_target)        
+        batch_size, seq_len, device = *mel_target.shape[:2], mel_target.device
+        
+        if isinstance(text, list):
+            if exists(self.vocab_char_map):
+                text = list_str_to_idx(text, self.vocab_char_map).to(device)
+            else:
+                sys.exit("MDD must have a vocab file")
+            assert text.shape[0] == batch_size
+
+        if isinstance(duration, int):
+            duration = torch.full((batch_size,), duration, device=device, dtype=torch.long)
+        else:
+            sys.exit("MDD: duariont must be a int")
+        
+        max_t_len = torch.max((text != -1).sum(dim=-1))  # MDD: duration at least text
+
+        ##MDD check
+        assert torch.all(duration == duration[0])
+        assert seq_len == duration[0]
+        assert lens is None
+        assert duration[0] <= max_duration
+        assert duration[0] >= max_t_len         
+        # cond_mask should be all 1 for MDD
+        cond_mask = lens_to_mask(duration)
+        assert cond_mask[0].sum() == seq_len
+   
+        # duplicate test corner for inner time step oberservation
+        if duplicate_test:
+            #test_cond = F.pad(cond, (0, 0, cond_seq_len, max_duration - 2 * cond_seq_len), value=0.0)
+            sys.exit("MDD: not supported.")
+            
+        ##MDD, we don't pad anything than masking the target segment)
+        cond_mask = torch.stack(phoneme_mask_list).unsqueeze(-1)
+        step_cond = torch.where(
+            cond_mask, mel_target, torch.zeros_like(mel_target)
+        )  
+        att_mask = None
+        
+        ##test
+        # step_cond=step_cond[:10]
+        # text=text[:10]
+        
+        # neural ode
+        def fn(t, x):
+            # at each step, conditioning is fixed
+            # step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
+
+            # predict flow
+            pred = self.transformer(
+                x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=False, drop_text=False, cache=True
+            )
+            if cfg_strength < 1e-5:
+                return pred
+
+            null_pred = self.transformer(
+                #x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=True, drop_text=True, cache=True
+                x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=False, drop_text=True, cache=True
+            )
+            return pred + (pred - null_pred) * cfg_strength
+        
+        if diff_symbol == None:  ## all ZERO cases, check class TextEmbedding
+            def fn_null(t, x):
+                null_pred = self.transformer(
+                    x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=False, drop_text=True, cache=True
+                )
+                return null_pred
+        else: 
+            def fn_null(t, x):
+                #text_null = torch.ones_like(text)*self.vocab_char_map[diff_symbol]
+                text_null = torch.ones(mel_target.shape[0], mel_target.shape[1], dtype=torch.long, device=device)*self.vocab_char_map[diff_symbol]
+                null_pred = self.transformer(
+                    x=x, cond=step_cond, text=text_null, time=t, mask=att_mask, drop_audio_cond=False, drop_text=False, cache=True
+                )
+                return null_pred
+        # speech input
+        y1 = mel_target
+        t_start = 1
+        t = torch.linspace(t_start, 0, steps + 1, device=self.device, dtype=step_cond.dtype)
+        t_f = torch.linspace(0, 1, steps + 1, device=self.device, dtype=step_cond.dtype)
+        
+  
+        if sway_sampling_coef is not None:
+            t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+            t_f = t_f + sway_sampling_coef * (torch.cos(torch.pi / 2 * t_f) - 1 + t_f)
+        
+        ##reversed dt for forward ODE
+        dt = [ t[len(t)-i-2] - t[len(t)-i-1] for i in range(len(t)-1)]
+        
+        ##backward pass
+        
+        # #test
+        # y1=y1[:10]
+        self.odeint_kwargs["method"] = "euler"
+        solutions = odeint(fn, y1, t, **self.odeint_kwargs)
+        self.transformer.clear_cache()
+        sampled_y0 = solutions[-1]
+        directions = ((solutions - sampled_y0).flip([0]))[1:]
+        ##NULL
+        solutions_null = odeint(fn_null, sampled_y0, t_f, **self.odeint_kwargs)
+        self.transformer.clear_cache()
+        directions_null = (solutions_null - sampled_y0)[1:]
+        ##similarity based log-prob, t-accumulated cos-similarity diffence
+        optimal_dir = y1 - sampled_y0
+        cos = nn.CosineSimilarity(dim=-1)
+        sim = 0
+        sim_null = 0
+        for i, (dir, dir_null) in enumerate(zip(directions, directions_null)):
+            sim += cos(optimal_dir, dir)*dt[i]
+            sim_null += cos(optimal_dir, dir_null)*dt[i]
+
+        return sim, sim_null
+  
+    ##  Jacobian replace 3, distance end-point
+    def compute_anchor_dist(
+        self,
+        mel_target: float["b n d"] | float["b nw"],  # noqa: F722
+        text: int["b nt"] | list[str],  # noqa: F722
+        duration: int | int["b"],  # noqa: F821
+        *,
+        lens: int["b"] | None = None,  # noqa: F821
+        steps=32,
+        cfg_strength=0,
+        sway_sampling_coef=None,
+        max_duration=4096,
+        duplicate_test=False,
+        diff_symbol=None,
+        phoneme_mask_list=None,
+    ):
+        self.eval()
+        # check methods, it does not matter 
+        assert self.odeint_kwargs["method"] == "euler_mdd" or self.odeint_kwargs["method"] == "euler"
+        # raw wave
+        if mel_target[0].ndim != 2:
+            # cond = self.mel_spec(cond)
+            # cond = cond.permute(0, 2, 1)
+            # assert cond.shape[-1] == self.num_channels
+            sys.exit("MDD: input must be mel")
+        
+        ## To tensors
+        mel_target = torch.stack(mel_target)        
+        batch_size, seq_len, device = *mel_target.shape[:2], mel_target.device
+        
+        if isinstance(text, list):
+            if exists(self.vocab_char_map):
+                text = list_str_to_idx(text, self.vocab_char_map).to(device)
+            else:
+                sys.exit("MDD must have a vocab file")
+            assert text.shape[0] == batch_size
+
+        if isinstance(duration, int):
+            duration = torch.full((batch_size,), duration, device=device, dtype=torch.long)
+        else:
+            sys.exit("MDD: duariont must be a int")
+        
+        max_t_len = torch.max((text != -1).sum(dim=-1))  # MDD: duration at least text
+
+        ##MDD check
+        assert torch.all(duration == duration[0])
+        assert seq_len == duration[0]
+        assert lens is None
+        assert duration[0] <= max_duration
+        assert duration[0] >= max_t_len         
+        # cond_mask should be all 1 for MDD
+        cond_mask = lens_to_mask(duration)
+        assert cond_mask[0].sum() == seq_len
+   
+        # duplicate test corner for inner time step oberservation
+        if duplicate_test:
+            #test_cond = F.pad(cond, (0, 0, cond_seq_len, max_duration - 2 * cond_seq_len), value=0.0)
+            sys.exit("MDD: not supported.")
+            
+        ##MDD, we don't pad anything than masking the target segment)
+        cond_mask = torch.stack(phoneme_mask_list).unsqueeze(-1)
+        step_cond = torch.where(
+            cond_mask, mel_target, torch.zeros_like(mel_target)
+        )  
+        att_mask = None
+        
+        ##test
+        # step_cond=step_cond[:10]
+        # text=text[:10]
+        
+        # neural ode
+        def fn(t, x):
+            # at each step, conditioning is fixed
+            # step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
+
+            # predict flow
+            pred = self.transformer(
+                x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=False, drop_text=False, cache=True
+            )
+            if cfg_strength < 1e-5:
+                return pred
+
+            null_pred = self.transformer(
+                x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=True, drop_text=True, cache=True
+            )
+            return pred + (pred - null_pred) * cfg_strength
+        
+        if diff_symbol == None:  ## all ZERO cases, check class TextEmbedding
+            def fn_null(t, x):
+                null_pred = self.transformer(
+                    x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=False, drop_text=True, cache=True
+                )
+                return null_pred
+        else: 
+            def fn_null(t, x):
+                #text_null = torch.ones_like(text)*self.vocab_char_map[diff_symbol]
+                text_null = torch.ones(mel_target.shape[0], mel_target.shape[1], dtype=torch.long, device=device)*self.vocab_char_map[diff_symbol]
+                null_pred = self.transformer(
+                    x=x, cond=step_cond, text=text_null, time=t, mask=att_mask, drop_audio_cond=False, drop_text=False, cache=True
+                )
+                return null_pred
+        # speech input
+        y1 = mel_target
+        t_start = 1
+        t = torch.linspace(t_start, 0, steps + 1, device=self.device, dtype=step_cond.dtype)
+        t_f = torch.linspace(0, 1, steps + 1, device=self.device, dtype=step_cond.dtype)
+        
+  
+        if sway_sampling_coef is not None:
+            t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+            t_f = t_f + sway_sampling_coef * (torch.cos(torch.pi / 2 * t_f) - 1 + t_f)
+        
+        ##reversed dt for forward ODE
+        dt = [ t[len(t)-i-2] - t[len(t)-i-1] for i in range(len(t)-1)]
+        
+        ##backward pass
+        self.odeint_kwargs["method"] = "euler"
+        solutions = odeint(fn, y1, t, **self.odeint_kwargs)
+        self.transformer.clear_cache()
+        sampled_y0 = solutions[-1]
+        ##null forward pass
+        solutions_null = odeint(fn_null, sampled_y0, t_f, **self.odeint_kwargs)
+        self.transformer.clear_cache()
+        null_points = solutions_null[-1] 
+        ##similarity based on anchor point
+        y0_anchor = torch.zeros_like(y1)
+        solutions_anchor = odeint(fn, y0_anchor, t_f, **self.odeint_kwargs)
+        self.transformer.clear_cache()
+        anchor_points = solutions_anchor[-1]
+        
+        ###cos-similarity, already normalized, otherwise we could use L2(normalized with the length of y1 or dist(y1,anchor))
+        cos = nn.CosineSimilarity(dim=-1) 
+        dist = cos(anchor_points, y1)
+        dist_null_relative = cos(anchor_points, null_points)
+
+        return dist, dist_null_relative
+    
+    def compute_prob_wrong(
+        self,
+        mel_target: float["b n d"] | float["b nw"],  # noqa: F722
+        text: int["b nt"] | list[str],  # noqa: F722
+        duration: int | int["b"],  # noqa: F821
+        *,
+        lens: int["b"] | None = None,  # noqa: F821
+        steps=32,
+        cfg_strength=0,
+        sway_sampling_coef=None,
+        max_duration=4096,
+        duplicate_test=False,
+        diff_symbol=None,
+        phoneme_mask_list=None,
+    ):
+        self.eval()
+        # check methods
+        assert self.odeint_kwargs["method"] == "euler_mdd"
+        # raw wave
+        if mel_target[0].ndim != 2:
+            # cond = self.mel_spec(cond)
+            # cond = cond.permute(0, 2, 1)
+            # assert cond.shape[-1] == self.num_channels
+            sys.exit("MDD: input must be mel")
+        
+        ## To tensors
+        mel_target = torch.stack(mel_target)    
         batch_size, seq_len, device = *mel_target.shape[:2], mel_target.device
         
         if isinstance(text, list):
@@ -285,7 +825,7 @@ class CFM_MDD(nn.Module):
                 x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=False, drop_text=False, cache=True
             )
             if cfg_strength < 1e-5:
-                return pred
+                return pred 
 
             null_pred = self.transformer(
                 x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=True, drop_text=True, cache=True
@@ -295,20 +835,21 @@ class CFM_MDD(nn.Module):
         if diff_symbol == None:  ## all ZERO cases, check class TextEmbedding
             def fn_null(t, x):
                 null_pred = self.transformer(
-                    x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=True, drop_text=True, cache=True
+                    x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=False, drop_text=True, cache=True
                 )
                 return null_pred
         else: 
             def fn_null(t, x):
                 text_null = torch.ones_like(text)*self.vocab_char_map[diff_symbol]
                 null_pred = self.transformer(
-                    x=x, cond=step_cond, text=text_null, time=t, mask=att_mask, drop_audio_cond=True, drop_text=True, cache=True
+                    x=x, cond=step_cond, text=text_null, time=t, mask=att_mask, drop_audio_cond=False, drop_text=False, cache=True
                 )
                 return null_pred
         # speech input
         y1 = mel_target
         t_start = 1
         t = torch.linspace(t_start, 0, steps + 1, device=self.device, dtype=step_cond.dtype)
+
         if sway_sampling_coef is not None:
             t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
         
@@ -316,13 +857,13 @@ class CFM_MDD(nn.Module):
         dt = [ t[len(t)-i-2] - t[len(t)-i-1] for i in range(len(t)-1)]
         
         ##backward pass
-        trajectory, jacob_trace = odeint_jacobian(fn, y1, t, **self.odeint_kwargs)
+        trajectory, jacob_trace = odeint_jacobian_wrong(fn, y1, t, cond_mask.squeeze(-1), cfg_strength, **self.odeint_kwargs)
         y0 = trajectory[-1]
         ##inverse jacob for forward pass
         jacob_trace = jacob_trace.flip([0])
         self.transformer.clear_cache()
         ##NULL
-        trajectory_null, jacob_trace_null = odeint_jacobian(fn_null, y1, t, **self.odeint_kwargs)
+        trajectory_null, jacob_trace_null = odeint_jacobian_wrong(fn_null, y1, t, cond_mask.squeeze(-1), cfg_strength, **self.odeint_kwargs)
         y0_null = trajectory_null[-1]
         jacob_trace_null = jacob_trace_null.flip([0])
         self.transformer.clear_cache()
@@ -334,80 +875,209 @@ class CFM_MDD(nn.Module):
         ## the last jacob is not needed for forward pass
         for i, (jacob_t, jacob_t_null) in enumerate(zip(jacob_trace[:-1], jacob_trace_null[:-1])):
             log_prob_y0 += -jacob_t*dt[i]
-            log_prob_y0_null += jacob_t_null*dt[i]
+            log_prob_y0_null += -jacob_t_null*dt[i]
         return log_prob_y0, log_prob_y0_null
     
-    def forward(
+    def compute_prob_noJac(
         self,
-        inp: float["b n d"] | float["b nw"],  # mel or raw wave  # noqa: F722
+        mel_target: float["b n d"] | float["b nw"],  # noqa: F722
         text: int["b nt"] | list[str],  # noqa: F722
+        duration: int | int["b"],  # noqa: F821
         *,
         lens: int["b"] | None = None,  # noqa: F821
-        noise_scheduler: str | None = None,
+        steps=32,
+        cfg_strength=0,
+        sway_sampling_coef=None,
+        max_duration=4096,
+        duplicate_test=False,
+        diff_symbol=None,
+        phoneme_mask_list=None,
     ):
-        # handle raw wave
-        if inp.ndim == 2:
-            inp = self.mel_spec(inp)
-            inp = inp.permute(0, 2, 1)
-            assert inp.shape[-1] == self.num_channels
-
-        batch, seq_len, dtype, device, _σ1 = *inp.shape[:2], inp.dtype, self.device, self.sigma
-
-        # handle text as string
+        self.eval()
+        # check methods, it does not matter 
+        assert self.odeint_kwargs["method"] == "euler_mdd" or self.odeint_kwargs["method"] == "euler"
+        # raw wave
+        if mel_target[0].ndim != 2:
+            # cond = self.mel_spec(cond)
+            # cond = cond.permute(0, 2, 1)
+            # assert cond.shape[-1] == self.num_channels
+            sys.exit("MDD: input must be mel")
+        
+        ## To tensors
+        mel_target = torch.stack(mel_target)        
+        batch_size, seq_len, device = *mel_target.shape[:2], mel_target.device
+        
         if isinstance(text, list):
             if exists(self.vocab_char_map):
                 text = list_str_to_idx(text, self.vocab_char_map).to(device)
             else:
-                text = list_str_to_tensor(text).to(device)
-            assert text.shape[0] == batch
+                sys.exit("MDD must have a vocab file")
+            assert text.shape[0] == batch_size
 
-        # lens and mask
-        if not exists(lens):
-            lens = torch.full((batch,), seq_len, device=device)
-
-        mask = lens_to_mask(lens, length=seq_len)  # useless here, as collate_fn will pad to max length in batch
-
-        # get a random span to mask out for training conditionally
-        frac_lengths = torch.zeros((batch,), device=self.device).float().uniform_(*self.frac_lengths_mask)
-        rand_span_mask = mask_from_frac_lengths(lens, frac_lengths)
-
-        if exists(mask):
-            rand_span_mask &= mask
-
-        # mel is x1
-        x1 = inp
-
-        # x0 is gaussian noise
-        x0 = torch.randn_like(x1)
-
-        # time step
-        time = torch.rand((batch,), dtype=dtype, device=self.device)
-        # TODO. noise_scheduler
-
-        # sample xt (φ_t(x) in the paper)
-        t = time.unsqueeze(-1).unsqueeze(-1)
-        φ = (1 - t) * x0 + t * x1
-        flow = x1 - x0
-
-        # only predict what is within the random mask span for infilling
-        cond = torch.where(rand_span_mask[..., None], torch.zeros_like(x1), x1)
-
-        # transformer and cfg training with a drop rate
-        drop_audio_cond = random() < self.audio_drop_prob  # p_drop in voicebox paper
-        if random() < self.cond_drop_prob:  # p_uncond in voicebox paper
-            drop_audio_cond = True
-            drop_text = True
+        if isinstance(duration, int):
+            duration = torch.full((batch_size,), duration, device=device, dtype=torch.long)
         else:
-            drop_text = False
+            sys.exit("MDD: duariont must be a int")
+        
+        max_t_len = torch.max((text != -1).sum(dim=-1))  # MDD: duration at least text
 
-        # if want rigourously mask out padding, record in collate_fn in dataset.py, and pass in here
-        # adding mask will use more memory, thus also need to adjust batchsampler with scaled down threshold for long sequences
-        pred = self.transformer(
-            x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text
-        )
+        ##MDD check
+        assert torch.all(duration == duration[0])
+        assert seq_len == duration[0]
+        assert lens is None
+        assert duration[0] <= max_duration
+        assert duration[0] >= max_t_len         
+        # cond_mask should be all 1 for MDD
+        cond_mask = lens_to_mask(duration)
+        assert cond_mask[0].sum() == seq_len
+   
+        # duplicate test corner for inner time step oberservation
+        if duplicate_test:
+            #test_cond = F.pad(cond, (0, 0, cond_seq_len, max_duration - 2 * cond_seq_len), value=0.0)
+            sys.exit("MDD: not supported.")
+            
+        ##MDD, we don't pad anything than masking the target segment)
+        cond_mask = torch.stack(phoneme_mask_list).unsqueeze(-1)
+        step_cond = torch.where(
+            cond_mask, mel_target, torch.zeros_like(mel_target)
+        )  
+        att_mask = None
+        
+        ##test
+        # step_cond=step_cond[:10]
+        # text=text[:10]
+        
+        # neural ode
+        def fn(t, x):
+            # at each step, conditioning is fixed
+            # step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
 
-        # flow matching loss
-        loss = F.mse_loss(pred, flow, reduction="none")
-        loss = loss[rand_span_mask]
+            # predict flow
+            pred = self.transformer(
+                x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=False, drop_text=False, cache=True
+            )
+            if cfg_strength < 1e-5:
+                return pred
 
-        return loss.mean(), cond, pred
+            null_pred = self.transformer(
+                x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=True, drop_text=True, cache=True
+            )
+            return pred + (pred - null_pred) * cfg_strength
+        
+        if diff_symbol == None:  ## all ZERO cases, check class TextEmbedding
+            def fn_null(t, x):
+                null_pred = self.transformer(
+                    x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=False, drop_text=True, cache=True
+                )
+                return null_pred
+        else: 
+            def fn_null(t, x):
+                text_null = torch.ones_like(text)*self.vocab_char_map[diff_symbol]
+                null_pred = self.transformer(
+                    x=x, cond=step_cond, text=text_null, time=t, mask=att_mask, drop_audio_cond=False, drop_text=False, cache=True
+                )
+                return null_pred
+        # speech input
+        y1 = mel_target
+        t_start = 1
+        t = torch.linspace(t_start, 0, steps + 1, device=self.device, dtype=step_cond.dtype)
+  
+        if sway_sampling_coef is not None:
+            t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+        
+        ##reversed dt for forward ODE
+        dt = [ t[len(t)-i-2] - t[len(t)-i-1] for i in range(len(t)-1)]
+        
+        ##backward pass
+        
+        # #test
+        # y1=y1[:10]
+        self.odeint_kwargs["method"] = "euler"
+        trajectory = odeint(fn, y1, t, **self.odeint_kwargs)
+        y0 = trajectory[-1]
+        self.transformer.clear_cache()
+        ##NULL
+        trajectory_null = odeint(fn_null, y1, t, **self.odeint_kwargs)
+        y0_null = trajectory_null[-1]
+        self.transformer.clear_cache()
+        
+        norm = Normal(torch.tensor([0.0], device=device), torch.tensor([1.0],device=device))
+        log_prob_y0 = norm.log_prob(y0).sum(-1)
+        log_prob_y0_null = norm.log_prob(y0_null).sum(-1)
+    
+        return log_prob_y0, log_prob_y0_null
+  
+    # def forward(
+    #     self,
+    #     inp: float["b n d"] | float["b nw"],  # mel or raw wave  # noqa: F722
+    #     text: int["b nt"] | list[str],  # noqa: F722
+    #     *,
+    #     lens: int["b"] | None = None,  # noqa: F821
+    #     noise_scheduler: str | None = None,
+    # ):
+    #     # handle raw wave
+    #     if inp.ndim == 2:
+    #         inp = self.mel_spec(inp)
+    #         inp = inp.permute(0, 2, 1)
+    #         assert inp.shape[-1] == self.num_channels
+
+    #     batch, seq_len, dtype, device, _σ1 = *inp.shape[:2], inp.dtype, self.device, self.sigma
+
+    #     # handle text as string
+    #     if isinstance(text, list):
+    #         if exists(self.vocab_char_map):
+    #             text = list_str_to_idx(text, self.vocab_char_map).to(device)
+    #         else:
+    #             text = list_str_to_tensor(text).to(device)
+    #         assert text.shape[0] == batch
+
+    #     # lens and mask
+    #     if not exists(lens):
+    #         lens = torch.full((batch,), seq_len, device=device)
+
+    #     mask = lens_to_mask(lens, length=seq_len)  # useless here, as collate_fn will pad to max length in batch
+
+    #     # get a random span to mask out for training conditionally
+    #     frac_lengths = torch.zeros((batch,), device=self.device).float().uniform_(*self.frac_lengths_mask)
+    #     rand_span_mask = mask_from_frac_lengths(lens, frac_lengths)
+
+    #     if exists(mask):
+    #         rand_span_mask &= mask
+
+    #     # mel is x1
+    #     x1 = inp
+
+    #     # x0 is gaussian noise
+    #     x0 = torch.randn_like(x1)
+
+    #     # time step
+    #     time = torch.rand((batch,), dtype=dtype, device=self.device)
+    #     # TODO. noise_scheduler
+
+    #     # sample xt (φ_t(x) in the paper)
+    #     t = time.unsqueeze(-1).unsqueeze(-1)
+    #     φ = (1 - t) * x0 + t * x1
+    #     flow = x1 - x0
+
+    #     # only predict what is within the random mask span for infilling
+    #     cond = torch.where(rand_span_mask[..., None], torch.zeros_like(x1), x1)
+
+    #     # transformer and cfg training with a drop rate
+    #     drop_audio_cond = random() < self.audio_drop_prob  # p_drop in voicebox paper
+    #     if random() < self.cond_drop_prob:  # p_uncond in voicebox paper
+    #         drop_audio_cond = True
+    #         drop_text = True
+    #     else:
+    #         drop_text = False
+
+    #     # if want rigourously mask out padding, record in collate_fn in dataset.py, and pass in here
+    #     # adding mask will use more memory, thus also need to adjust batchsampler with scaled down threshold for long sequences
+    #     pred = self.transformer(
+    #         x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text
+    #     )
+
+    #     # flow matching loss
+    #     loss = F.mse_loss(pred, flow, reduction="none")
+    #     loss = loss[rand_span_mask]
+
+    #     return loss.mean(), cond, pred

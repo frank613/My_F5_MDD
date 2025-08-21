@@ -289,6 +289,7 @@ def load_model_mdd(
     print("model : ", ckpt_path, "\n")
 
     vocab_char_map, vocab_size = get_tokenizer(vocab_file, tokenizer)
+    assert ode_method=="euler" or ode_method=="euler_mdd"
     model = CFM_MDD(
         transformer=model_cls(**model_cfg, text_num_embeds=vocab_size, mel_dim=n_mel_channels),
         mel_spec_kwargs=dict(
@@ -300,7 +301,7 @@ def load_model_mdd(
             mel_spec_type=mel_spec_type,
         ),
         odeint_kwargs=dict(
-            method=ode_method,
+            method="euler_mdd",
         ),
         vocab_char_map=vocab_char_map,
     ).to(device)

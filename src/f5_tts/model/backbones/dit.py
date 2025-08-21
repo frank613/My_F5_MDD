@@ -56,7 +56,6 @@ class TextEmbedding(nn.Module):
 
         if drop_text:  # cfg for text
             text = torch.zeros_like(text)
-
         text = self.text_embed(text)  # b n -> b n d
 
         # possible extra modeling
