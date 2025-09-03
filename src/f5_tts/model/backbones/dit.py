@@ -12,6 +12,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 import torch.nn.functional as F
+import pdb,sys
 
 from x_transformers.x_transformers import RotaryEmbedding
 
@@ -194,8 +195,17 @@ class DiT(nn.Module):
     ):
         batch, seq_len = x.shape[0], x.shape[1]
         if time.ndim == 0:
-            time = time.repeat(batch)
+            time = time.repeat(batch) 
 
+        ###MDD extended input
+        dup = None
+        if cond.shape[0] != batch:
+            if batch % cond.shape[0] == 0:
+                dup = int (batch/ cond.shape[0])
+            else:
+                pdb.set_trafce()
+                sys.exit("unmatched input")   
+                 
         # t: conditioning time, text: text, x: noised audio + cond audio + text
         t = self.time_embed(time)
         if cache:
@@ -209,6 +219,11 @@ class DiT(nn.Module):
                 text_embed = self.text_cond
         else:
             text_embed = self.text_embed(text, seq_len, drop_text=drop_text)
+        ##MDD extended input
+        if dup is not None:
+            text_embed = text_embed.repeat(dup,1,1)
+            cond = cond.repeat(dup,1,1)
+        
         x = self.input_embed(x, cond, text_embed, drop_audio_cond=drop_audio_cond)
 
         rope = self.rotary_embed.forward_from_seq_len(seq_len)

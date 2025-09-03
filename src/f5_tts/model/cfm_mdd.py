@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
-from torchdiffeq import odeint,odeint_jacobian,odeint_jacobian_wrong,odeint_dist
+from torchdiffeq import odeint,odeint_jacobian,odeint_jacobian_wrong,odeint_dist,odeint_jacobian_aabb
 
 from f5_tts.model.modules import MelSpec
 from f5_tts.model.utils import (
@@ -1256,8 +1256,8 @@ class CFM_MDD(nn.Module):
                 return pred
 
             null_pred = self.transformer(
-                x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=True, drop_text=True, cache=True
-                #x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=False, drop_text=True, cache=True
+                #x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=True, drop_text=True, cache=True
+                x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=False, drop_text=True, cache=True
             )
             return pred + (pred - null_pred) * cfg_strength
         
@@ -1300,16 +1300,24 @@ class CFM_MDD(nn.Module):
         directions_null = ((solutions_null - y0_null).flip([0]))[1:]
         ###start-prob-log
         norm = Normal(torch.tensor([0.0], device=device), torch.tensor([1.0],device=device))
-        log_prob_y0 = norm.log_prob(sampled_y0).sum(-1)
-        log_prob_y0_null = norm.log_prob(y0_null).sum(-1)
+        ### Nomalization mean
+        # log_prob_y0 = norm.log_prob(sampled_y0).mean(-1)
+        # log_prob_y0_null = norm.log_prob(y0_null).mean(-1)
+        ### Nomalization mean X step_size
+        # log_prob_y0 = norm.log_prob(sampled_y0).mean(-1)*(steps)
+        # log_prob_y0_null = norm.log_prob(y0_null).mean(-1)*(steps)
+        ## NoStart
+        log_prob_y0 = 0
+        log_prob_y0_null = 0
         ##similarity based log-prob, t-accumulated cos-similarity diffence
         optimal_dir = y1 - sampled_y0
+        optimal_dir_null = y1 - y0_null
         cos = nn.CosineSimilarity(dim=-1)
         sim = log_prob_y0
         sim_null = log_prob_y0_null
         for i, (dir, dir_null) in enumerate(zip(directions, directions_null)):
             sim += cos(optimal_dir, dir)*dt[i]
-            sim_null += cos(optimal_dir, dir_null)*dt[i]
+            sim_null += cos(optimal_dir_null, dir_null)*dt[i]
 
         return sim, sim_null
     
@@ -1570,6 +1578,139 @@ class CFM_MDD(nn.Module):
     
         return log_prob_y0, log_prob_y0_null
   
+    def compute_prob_aabb(
+        self,
+        mel_target: float["b n d"] | float["b nw"],  # noqa: F722
+        text: int["b nt"] | list[str],  # noqa: F722
+        duration: int | int["b"],  # noqa: F821
+        *,
+        lens: int["b"] | None = None,  # noqa: F821
+        steps=32,
+        cfg_strength=0,
+        sway_sampling_coef=None,
+        max_duration=4096,
+        duplicate_test=False,
+        diff_symbol=None,
+        phoneme_mask_list=None,
+    ):
+        self.eval()
+        # check methods
+        assert self.odeint_kwargs["method"] == "euler_mdd"
+        # raw wave
+        if mel_target[0].ndim != 2:
+            # cond = self.mel_spec(cond)
+            # cond = cond.permute(0, 2, 1)
+            # assert cond.shape[-1] == self.num_channels
+            sys.exit("MDD: input must be mel")
+        
+        ## To tensors
+        mel_target = torch.stack(mel_target)    
+        batch_size, seq_len, device = *mel_target.shape[:2], mel_target.device
+        
+        if isinstance(text, list):
+            if exists(self.vocab_char_map):
+                text = list_str_to_idx(text, self.vocab_char_map).to(device)
+            else:
+                sys.exit("MDD must have a vocab file")
+            assert text.shape[0] == batch_size
+
+        if isinstance(duration, int):
+            duration = torch.full((batch_size,), duration, device=device, dtype=torch.long)
+        else:
+            sys.exit("MDD: duariont must be a int")
+        
+        max_t_len = torch.max((text != -1).sum(dim=-1))  # MDD: duration at least text
+
+        ##MDD check
+        assert torch.all(duration == duration[0])
+        assert seq_len == duration[0]
+        assert lens is None
+        assert duration[0] <= max_duration
+        assert duration[0] >= max_t_len         
+        # cond_mask should be all 1 for MDD
+        cond_mask = lens_to_mask(duration)
+        assert cond_mask[0].sum() == seq_len
+   
+        # duplicate test corner for inner time step oberservation
+        if duplicate_test:
+            #test_cond = F.pad(cond, (0, 0, cond_seq_len, max_duration - 2 * cond_seq_len), value=0.0)
+            sys.exit("MDD: not supported.")
+            
+        ##MDD, we don't pad anything than masking the target segment)
+        cond_mask = torch.stack(phoneme_mask_list).unsqueeze(-1)
+        step_cond = torch.where(
+            cond_mask, mel_target, torch.zeros_like(mel_target)
+        )  
+        att_mask = None
+        # neural ode
+        def fn(t, x):
+            # at each step, conditioning is fixed
+            # step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
+            # predict flow
+            # nonlocal step_cond
+            # nonlocal text
+            # if step_cond.shape[0] != x.shape[0]:
+            #     dup = x.shape[0] / step_cond.shape[0]
+            #     step_cond = step_cond.repeat(int(dup),1,1)
+            # if text.shape[0] != x.shape[0]:
+            #     dup = x.shape[0] / text.shape[0]
+            #     text = text.repeat(int(dup),1)
+            pred = self.transformer(
+                x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=False, drop_text=False, cache=True
+            )
+            if cfg_strength < 1e-5:
+                return pred 
+
+            null_pred = self.transformer(
+                x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=True, drop_text=True, cache=True
+            )
+            return pred + (pred - null_pred) * cfg_strength
+        
+        if diff_symbol == None:  ## all ZERO cases, check class TextEmbedding
+            def fn_null(t, x):
+                null_pred = self.transformer(
+                    x=x, cond=step_cond, text=text, time=t, mask=att_mask, drop_audio_cond=False, drop_text=True, cache=True
+                )
+                return null_pred
+        else: 
+            def fn_null(t, x):
+                text_null = torch.ones_like(text)*self.vocab_char_map[diff_symbol]
+                null_pred = self.transformer(
+                    x=x, cond=step_cond, text=text_null, time=t, mask=att_mask, drop_audio_cond=False, drop_text=False, cache=True
+                )
+                return null_pred
+        # speech input
+        y1 = mel_target
+        t_start = 1
+        t = torch.linspace(t_start, 0, steps + 1, device=self.device, dtype=step_cond.dtype)
+
+        if sway_sampling_coef is not None:
+            t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+        
+        ##reversed dt for forward ODE
+        dt = [ t[len(t)-i-2] - t[len(t)-i-1] for i in range(len(t)-1)]
+        
+        ##backward pass 
+        trajectory, jacob_trace = odeint_jacobian_aabb(fn, y1, t, **self.odeint_kwargs)
+        y0 = trajectory[-1]
+        ##inverse jacob for forward pass
+        jacob_trace = jacob_trace.flip([0])
+        self.transformer.clear_cache()
+        ##NULL
+        trajectory_null, jacob_trace_null = odeint_jacobian_aabb(fn_null, y1, t, **self.odeint_kwargs)
+        y0_null = trajectory_null[-1]
+        jacob_trace_null = jacob_trace_null.flip([0])
+        self.transformer.clear_cache()
+        
+        norm = Normal(torch.tensor([0.0], device=device), torch.tensor([1.0],device=device))
+        log_prob_y0 = norm.log_prob(y0).sum(-1)
+        log_prob_y0_null = norm.log_prob(y0_null).sum(-1)
+        ## manual Euler continous change of variable
+        ## the last jacob is not needed for forward pass
+        for i, (jacob_t, jacob_t_null) in enumerate(zip(jacob_trace, jacob_trace_null)):
+            log_prob_y0 += -jacob_t*dt[i]
+            log_prob_y0_null += -jacob_t_null*dt[i]
+        return log_prob_y0, log_prob_y0_null
     # def forward(
     #     self,
     #     inp: float["b n d"] | float["b nw"],  # mel or raw wave  # noqa: F722
