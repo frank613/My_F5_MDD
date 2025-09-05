@@ -203,7 +203,7 @@ class DiT(nn.Module):
             if batch % cond.shape[0] == 0:
                 dup = int (batch/ cond.shape[0])
             else:
-                pdb.set_trafce()
+                pdb.set_trace()
                 sys.exit("unmatched input")   
                  
         # t: conditioning time, text: text, x: noised audio + cond audio + text
@@ -225,7 +225,6 @@ class DiT(nn.Module):
             cond = cond.repeat(dup,1,1)
         
         x = self.input_embed(x, cond, text_embed, drop_audio_cond=drop_audio_cond)
-
         rope = self.rotary_embed.forward_from_seq_len(seq_len)
 
         if self.long_skip_connection is not None:
