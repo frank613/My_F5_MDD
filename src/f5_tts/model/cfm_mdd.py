@@ -1987,7 +1987,6 @@ class CFM_MDD(nn.Module):
             gop_null -= jacob_t_null*dt[i]
         ##take the average
         frame_num = torch.tensor( [ (~cond_mask[i]).sum() for i in range(cond_mask.shape[0])],device=device, dtype=torch.long)
-        pdb.set_trace()
         return gop/frame_num, gop_null/frame_num
     
     # def forward(
