@@ -177,6 +177,7 @@ class CFM(nn.Module):
         for dur in duration:
             if exists(seed):
                 torch.manual_seed(seed)
+            #y0.append(0*torch.ones(dur, self.num_channels, device=self.device, dtype=step_cond.dtype))
             y0.append(torch.randn(dur, self.num_channels, device=self.device, dtype=step_cond.dtype))
         y0 = pad_sequence(y0, padding_value=0, batch_first=True)
 
