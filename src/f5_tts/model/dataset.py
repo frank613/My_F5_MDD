@@ -131,6 +131,7 @@ class CustomDataset(Dataset):
             audio_path = row["audio_path"]
             text = row["text"]
             duration = row["duration"]
+            uid = row["uid"]
 
             # filter by given length
             if 0.3 <= duration <= 30:
@@ -159,6 +160,7 @@ class CustomDataset(Dataset):
         return {
             "mel_spec": mel_spec,
             "text": text,
+            "uid":uid,
         }
 
 
@@ -320,6 +322,7 @@ def collate_fn(batch):
     mel_specs = torch.stack(padded_mel_specs)
 
     text = [item["text"] for item in batch]
+    uids = [item["uid"] for item in batch]
     text_lengths = torch.LongTensor([len(item) for item in text])
 
     return dict(
@@ -327,4 +330,5 @@ def collate_fn(batch):
         mel_lengths=mel_lengths,
         text=text,
         text_lengths=text_lengths,
+        uids=uids,
     )
